@@ -1,0 +1,32 @@
+import { useEffect } from "react";
+import { Stack, useRouter } from "expo-router";
+
+import { useAuthStore } from "../../src/stores/auth.store";
+
+export default function TechnicianLayout() {
+  const router = useRouter();
+
+  const user = useAuthStore((state) => state.user);
+  const isInitialized = useAuthStore((state) => state.isInitialized);
+
+  useEffect(() => {
+    if (!isInitialized) return;
+
+    if (user?.role !== "technician") {
+      router.replace(
+        user?.role === "admin"
+          ? "/(admin)/dashboard"
+          : "/(auth)/login",
+      );
+    }
+  }, [isInitialized, user, router]);
+
+  return (
+    <Stack screenOptions={{ headerShown: false }}>
+      <Stack.Screen name="dashboard" />
+      <Stack.Screen name="create-invoice" />
+      <Stack.Screen name="history" />
+      <Stack.Screen name="profile" />
+    </Stack>
+  );
+}

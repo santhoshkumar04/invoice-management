@@ -1,0 +1,1400 @@
+import { and, asc, count, desc, eq, ilike, or, sql } from "drizzle-orm";
+
+import { db } from "../../db/client.js";
+import {
+  auditLogs,
+  customers,
+  invoiceAdjustments,
+  invoiceItems,
+  invoiceSequences,
+  invoiceSnapshots,
+  invoices,
+  organizations,
+  payments,
+  users,
+} from "../../db/schema/index.js";
+
+import {
+  calculateInvoiceItem,
+  calculateInvoiceTotals,
+  getFinancialYear,
+  type InvoiceSupplyType,
+} from "./invoice-calculations.js";
+
+import type {
+  CreateInvoiceInput,
+  ListInvoicesInput,
+  UpdateInvoiceInput,
+  CancelInvoiceInput,
+  CreatePaymentInput,
+  CreateInvoiceAdjustmentInput,
+} from "./schemas/invoices.schema.js";
+
+export interface CreateInvoiceContext {
+  organizationId: string;
+  userId: string;
+  ipAddress?: string;
+}
+
+export interface ListInvoicesContext {
+  organizationId: string;
+  userId: string;
+  role: "admin" | "technician";
+}
+
+function normalizeStateCode(value: string | null | undefined): string | null {
+  const normalized = value?.trim();
+  return normalized ? normalized : null;
+}
+
+function isIndia(value: string | null | undefined): boolean {
+  return value?.trim().toLowerCase() === "india";
+}
+
+function resolveGstSupplyType(
+  organization: {
+    country: string;
+    stateCode: string | null;
+    gstin: string | null;
+  },
+  customer: {
+    country: string | null;
+    stateCode: string | null;
+    gstin: string | null;
+  },
+): InvoiceSupplyType {
+  if (!isIndia(organization.country) || !isIndia(customer.country)) {
+    throw new Error("GST_COUNTRY_NOT_SUPPORTED");
+  }
+
+  const organizationStateCode = normalizeStateCode(organization.stateCode);
+  const customerStateCode = normalizeStateCode(customer.stateCode);
+
+  if (
+    !organizationStateCode ||
+    !customerStateCode ||
+    !/^\d{2}$/.test(organizationStateCode) ||
+    !/^\d{2}$/.test(customerStateCode)
+  ) {
+    throw new Error("GST_STATE_CODE_REQUIRED");
+  }
+
+  const organizationGstin = organization.gstin?.trim().toUpperCase();
+  const customerGstin = customer.gstin?.trim().toUpperCase();
+
+  if (
+    organizationGstin &&
+    organizationGstin.length === 15 &&
+    organizationGstin.slice(0, 2) !== organizationStateCode
+  ) {
+    throw new Error("ORGANIZATION_GSTIN_STATE_MISMATCH");
+  }
+
+  if (
+    customerGstin &&
+    customerGstin.length === 15 &&
+    customerGstin.slice(0, 2) !== customerStateCode
+  ) {
+    throw new Error("CUSTOMER_GSTIN_STATE_MISMATCH");
+  }
+
+  return organizationStateCode === customerStateCode
+    ? "intra_state"
+    : "inter_state";
+}
+
+export async function createInvoice(
+  context: CreateInvoiceContext,
+  input: CreateInvoiceInput,
+) {
+  const financialYear = getFinancialYear(input.invoiceDate);
+
+  return db.transaction(async (tx) => {
+    const [organization] = await tx
+      .select()
+      .from(organizations)
+      .where(eq(organizations.id, context.organizationId))
+      .limit(1);
+
+    if (!organization) {
+      throw new Error("ORGANIZATION_NOT_FOUND");
+    }
+
+    const [customer] = await tx
+      .select()
+      .from(customers)
+      .where(
+        and(
+          eq(customers.id, input.customerId),
+          eq(customers.organizationId, context.organizationId),
+          eq(customers.isActive, true),
+        ),
+      )
+      .limit(1);
+
+    if (!customer) {
+      throw new Error("CUSTOMER_NOT_FOUND");
+    }
+
+    let supplyType: InvoiceSupplyType | null = null;
+
+    if (input.isGstApplicable) {
+      if (input.currency !== "INR") {
+        throw new Error("GST_REQUIRES_INR_CURRENCY");
+      }
+
+      supplyType = resolveGstSupplyType(
+        {
+          country: organization.country,
+          stateCode: organization.stateCode,
+          gstin: organization.gstin,
+        },
+        {
+          country: customer.country,
+          stateCode: customer.stateCode,
+          gstin: customer.gstin,
+        },
+      );
+    }
+
+    // Atomic PostgreSQL upsert. Concurrent requests increment the same
+    // organization/financial-year sequence without duplicating numbers.
+    const [sequence] = await tx
+      .insert(invoiceSequences)
+      .values({
+        organizationId: context.organizationId,
+        financialYear,
+        lastNumber: 1,
+      })
+      .onConflictDoUpdate({
+        target: [
+          invoiceSequences.organizationId,
+          invoiceSequences.financialYear,
+        ],
+        set: {
+          lastNumber: sql`${invoiceSequences.lastNumber} + 1`,
+          updatedAt: new Date(),
+        },
+      })
+      .returning({
+        id: invoiceSequences.id,
+        prefix: invoiceSequences.prefix,
+        lastNumber: invoiceSequences.lastNumber,
+      });
+
+    if (!sequence) {
+      throw new Error("INVOICE_SEQUENCE_FAILED");
+    }
+
+    const invoiceNumber = `${sequence.prefix}/${financialYear}/${String(
+      sequence.lastNumber,
+    ).padStart(4, "0")}`;
+
+    const calculatedItems = input.items.map((item) =>
+      calculateInvoiceItem(item, input.isGstApplicable, supplyType),
+    );
+
+    const totals = calculateInvoiceTotals(calculatedItems);
+
+    const [invoice] = await tx
+      .insert(invoices)
+      .values({
+        organizationId: context.organizationId,
+        customerId: customer.id,
+        createdBy: context.userId,
+        sequenceId: sequence.id,
+        invoiceNumber,
+        invoiceDate: input.invoiceDate,
+        billingPeriodStart: input.billingPeriodStart,
+        billingPeriodEnd: input.billingPeriodEnd,
+        dueDate: input.dueDate ?? null,
+        vendorCode: customer.vendorCode,
+        currency: input.currency,
+        isGstApplicable: input.isGstApplicable,
+        supplyType,
+        subtotal: totals.subtotal,
+        cgstTotal: totals.cgstTotal,
+        sgstTotal: totals.sgstTotal,
+        igstTotal: totals.igstTotal,
+        totalTax: totals.totalTax,
+        roundOff: totals.roundOff,
+        grandTotal: totals.grandTotal,
+        notes: input.notes?.trim() || null,
+      })
+      .returning();
+
+    if (!invoice) {
+      throw new Error("INVOICE_CREATE_FAILED");
+    }
+
+    const insertedItems = await tx
+      .insert(invoiceItems)
+      .values(
+        input.items.map((item, index) => {
+          const calculated = calculatedItems[index];
+
+          if (!calculated) {
+            throw new Error("INVOICE_ITEM_CALCULATION_FAILED");
+          }
+
+          return {
+            invoiceId: invoice.id,
+            lineNumber: index + 1,
+            description: item.description,
+            quantity: item.quantity.toFixed(3),
+            rate: item.rate.toFixed(2),
+            amount: calculated.amount,
+            gstRate: calculated.gstRate,
+            cgstAmount: calculated.cgstAmount,
+            sgstAmount: calculated.sgstAmount,
+            igstAmount: calculated.igstAmount,
+          };
+        }),
+      )
+      .returning();
+
+    const snapshotData: Record<string, unknown> = {
+      snapshotVersion: 1,
+      invoice: {
+        ...invoice,
+        items: insertedItems,
+      },
+      organization: {
+        id: organization.id,
+        name: organization.name,
+        businessDescription: organization.businessDescription,
+        logoUrl: organization.logoUrl,
+        vendorCode: organization.vendorCode,
+        addressLine1: organization.addressLine1,
+        addressLine2: organization.addressLine2,
+        city: organization.city,
+        district: organization.district,
+        state: organization.state,
+        stateCode: organization.stateCode,
+        postalCode: organization.postalCode,
+        country: organization.country,
+        email: organization.email,
+        mobile: organization.mobile,
+        gstin: organization.gstin,
+        pan: organization.pan,
+        bankName: organization.bankName,
+        bankAccountName: organization.bankAccountName,
+        bankAccountNumber: organization.bankAccountNumber,
+        bankIfsc: organization.bankIfsc,
+        authorizedSignatory: organization.authorizedSignatory,
+        invoiceFooter: organization.invoiceFooter,
+      },
+      customer: {
+        id: customer.id,
+        customerName: customer.customerName,
+        companyName: customer.companyName,
+        contactPerson: customer.contactPerson,
+        email: customer.email,
+        mobile: customer.mobile,
+        addressLine1: customer.addressLine1,
+        addressLine2: customer.addressLine2,
+        city: customer.city,
+        district: customer.district,
+        state: customer.state,
+        stateCode: customer.stateCode,
+        postalCode: customer.postalCode,
+        country: customer.country,
+        gstin: customer.gstin,
+        pan: customer.pan,
+        vendorCode: customer.vendorCode,
+      },
+      totals,
+    };
+
+    await tx.insert(invoiceSnapshots).values({
+      invoiceId: invoice.id,
+      snapshotData,
+    });
+
+    await tx.insert(auditLogs).values({
+      organizationId: context.organizationId,
+      userId: context.userId,
+      action: "invoice.created",
+      entityType: "invoice",
+      entityId: invoice.id,
+      description: `Invoice ${invoiceNumber} created`,
+      oldValues: null,
+      newValues: {
+        invoiceNumber,
+        customerId: customer.id,
+        createdBy: context.userId,
+        status: invoice.status,
+        subtotal: totals.subtotal,
+        totalTax: totals.totalTax,
+        grandTotal: totals.grandTotal,
+        isGstApplicable: input.isGstApplicable,
+        supplyType,
+      },
+      ipAddress: context.ipAddress ?? null,
+    });
+
+    return {
+      ...invoice,
+      items: insertedItems,
+      snapshot: snapshotData,
+    };
+  });
+}
+
+export async function updateInvoice(
+  context: CreateInvoiceContext,
+  invoiceId: string,
+  input: UpdateInvoiceInput,
+) {
+  return db.transaction(async (tx) => {
+    // Lock the invoice so edits cannot race with issuance or another edit.
+    const [existingInvoice] = await tx
+      .select()
+      .from(invoices)
+      .where(
+        and(
+          eq(invoices.id, invoiceId),
+          eq(invoices.organizationId, context.organizationId),
+        ),
+      )
+      .for("update")
+      .limit(1);
+
+    if (!existingInvoice) {
+      throw new Error("INVOICE_NOT_FOUND");
+    }
+
+    if (existingInvoice.status !== "draft") {
+      throw new Error("INVOICE_EDIT_NOT_DRAFT");
+    }
+
+    const [organization] = await tx
+      .select()
+      .from(organizations)
+      .where(eq(organizations.id, context.organizationId))
+      .limit(1);
+
+    if (!organization) {
+      throw new Error("ORGANIZATION_NOT_FOUND");
+    }
+
+    const [customer] = await tx
+      .select()
+      .from(customers)
+      .where(
+        and(
+          eq(customers.id, input.customerId),
+          eq(customers.organizationId, context.organizationId),
+          eq(customers.isActive, true),
+        ),
+      )
+      .limit(1);
+
+    if (!customer) {
+      throw new Error("CUSTOMER_NOT_FOUND");
+    }
+
+    let supplyType: InvoiceSupplyType | null = null;
+
+    if (input.isGstApplicable) {
+      if (input.currency !== "INR") {
+        throw new Error("GST_REQUIRES_INR_CURRENCY");
+      }
+
+      supplyType = resolveGstSupplyType(
+        {
+          country: organization.country,
+          stateCode: organization.stateCode,
+          gstin: organization.gstin,
+        },
+        {
+          country: customer.country,
+          stateCode: customer.stateCode,
+          gstin: customer.gstin,
+        },
+      );
+    }
+
+    const calculatedItems = input.items.map((item) =>
+      calculateInvoiceItem(item, input.isGstApplicable, supplyType),
+    );
+
+    const totals = calculateInvoiceTotals(calculatedItems);
+
+    const [updatedInvoice] = await tx
+      .update(invoices)
+      .set({
+        customerId: customer.id,
+        invoiceDate: input.invoiceDate,
+        billingPeriodStart: input.billingPeriodStart,
+        billingPeriodEnd: input.billingPeriodEnd,
+        dueDate: input.dueDate ?? null,
+        vendorCode: customer.vendorCode,
+        currency: input.currency,
+        isGstApplicable: input.isGstApplicable,
+        supplyType,
+        subtotal: totals.subtotal,
+        cgstTotal: totals.cgstTotal,
+        sgstTotal: totals.sgstTotal,
+        igstTotal: totals.igstTotal,
+        totalTax: totals.totalTax,
+        roundOff: totals.roundOff,
+        grandTotal: totals.grandTotal,
+        notes: input.notes?.trim() || null,
+        updatedAt: new Date(),
+      })
+      .where(eq(invoices.id, invoiceId))
+      .returning();
+
+    if (!updatedInvoice) {
+      throw new Error("INVOICE_UPDATE_FAILED");
+    }
+
+    // Replace all invoice lines atomically.
+    await tx.delete(invoiceItems).where(eq(invoiceItems.invoiceId, invoiceId));
+
+    const insertedItems = await tx
+      .insert(invoiceItems)
+      .values(
+        input.items.map((item, index) => {
+          const calculated = calculatedItems[index];
+
+          if (!calculated) {
+            throw new Error("INVOICE_ITEM_CALCULATION_FAILED");
+          }
+
+          return {
+            invoiceId,
+            lineNumber: index + 1,
+            description: item.description,
+            quantity: item.quantity.toFixed(3),
+            rate: item.rate.toFixed(2),
+            amount: calculated.amount,
+            gstRate: calculated.gstRate,
+            cgstAmount: calculated.cgstAmount,
+            sgstAmount: calculated.sgstAmount,
+            igstAmount: calculated.igstAmount,
+          };
+        }),
+      )
+      .returning();
+
+    // Rebuild the existing invoice snapshot using the updated invoice data.
+    const snapshotData: Record<string, unknown> = {
+      snapshotVersion: 1,
+      invoice: {
+        ...updatedInvoice,
+        items: insertedItems,
+      },
+      organization: {
+        id: organization.id,
+        name: organization.name,
+        businessDescription: organization.businessDescription,
+        logoUrl: organization.logoUrl,
+        vendorCode: organization.vendorCode,
+        addressLine1: organization.addressLine1,
+        addressLine2: organization.addressLine2,
+        city: organization.city,
+        district: organization.district,
+        state: organization.state,
+        stateCode: organization.stateCode,
+        postalCode: organization.postalCode,
+        country: organization.country,
+        email: organization.email,
+        mobile: organization.mobile,
+        gstin: organization.gstin,
+        pan: organization.pan,
+        bankName: organization.bankName,
+        bankAccountName: organization.bankAccountName,
+        bankAccountNumber: organization.bankAccountNumber,
+        bankIfsc: organization.bankIfsc,
+        authorizedSignatory: organization.authorizedSignatory,
+        invoiceFooter: organization.invoiceFooter,
+      },
+      customer: {
+        id: customer.id,
+        customerName: customer.customerName,
+        companyName: customer.companyName,
+        contactPerson: customer.contactPerson,
+        email: customer.email,
+        mobile: customer.mobile,
+        addressLine1: customer.addressLine1,
+        addressLine2: customer.addressLine2,
+        city: customer.city,
+        district: customer.district,
+        state: customer.state,
+        stateCode: customer.stateCode,
+        postalCode: customer.postalCode,
+        country: customer.country,
+        gstin: customer.gstin,
+        pan: customer.pan,
+        vendorCode: customer.vendorCode,
+      },
+      totals,
+    };
+
+    const updatedSnapshot = await tx
+      .update(invoiceSnapshots)
+      .set({
+        snapshotVersion: new Date(),
+        snapshotData,
+      })
+      .where(eq(invoiceSnapshots.invoiceId, invoiceId))
+      .returning({ id: invoiceSnapshots.id });
+
+    // Defensive fallback for an older invoice missing its snapshot.
+    if (updatedSnapshot.length === 0) {
+      await tx.insert(invoiceSnapshots).values({
+        invoiceId,
+        snapshotData,
+      });
+    }
+
+    await tx.insert(auditLogs).values({
+      organizationId: context.organizationId,
+      userId: context.userId,
+      action: "invoice.updated",
+      entityType: "invoice",
+      entityId: invoiceId,
+      description: `Draft invoice ${existingInvoice.invoiceNumber} updated`,
+      oldValues: {
+        status: existingInvoice.status,
+        customerId: existingInvoice.customerId,
+        invoiceDate: existingInvoice.invoiceDate,
+        billingPeriodStart: existingInvoice.billingPeriodStart,
+        billingPeriodEnd: existingInvoice.billingPeriodEnd,
+        dueDate: existingInvoice.dueDate,
+        subtotal: existingInvoice.subtotal,
+        totalTax: existingInvoice.totalTax,
+        grandTotal: existingInvoice.grandTotal,
+        isGstApplicable: existingInvoice.isGstApplicable,
+      },
+      newValues: {
+        status: updatedInvoice.status,
+        customerId: updatedInvoice.customerId,
+        invoiceDate: updatedInvoice.invoiceDate,
+        billingPeriodStart: updatedInvoice.billingPeriodStart,
+        billingPeriodEnd: updatedInvoice.billingPeriodEnd,
+        dueDate: updatedInvoice.dueDate,
+        subtotal: updatedInvoice.subtotal,
+        totalTax: updatedInvoice.totalTax,
+        grandTotal: updatedInvoice.grandTotal,
+        isGstApplicable: updatedInvoice.isGstApplicable,
+      },
+      ipAddress: context.ipAddress ?? null,
+    });
+
+    return {
+      ...updatedInvoice,
+      items: insertedItems,
+      snapshot: snapshotData,
+    };
+  });
+}
+
+export async function listInvoices(
+  context: ListInvoicesContext,
+  input: {
+    page: number;
+    limit: number;
+    search?: string;
+    status:
+      | "draft"
+      | "issued"
+      | "partially_paid"
+      | "paid"
+      | "cancelled"
+      | "all";
+  },
+) {
+  const filters = [eq(invoices.organizationId, context.organizationId)];
+
+  if (context.role === "technician") {
+    filters.push(eq(invoices.createdBy, context.userId));
+  }
+
+  if (input.status !== "all") {
+    filters.push(eq(invoices.status, input.status));
+  }
+
+  const search = input.search?.trim();
+
+  if (search) {
+    const pattern = `%${search}%`;
+
+    filters.push(
+      or(
+        ilike(invoices.invoiceNumber, pattern),
+        ilike(customers.customerName, pattern),
+        ilike(customers.companyName, pattern),
+      )!,
+    );
+  }
+
+  const whereCondition = and(...filters);
+
+  const offset = (input.page - 1) * input.limit;
+
+  const [countResult, rows] = await Promise.all([
+    db
+      .select({ total: count() })
+      .from(invoices)
+      .innerJoin(customers, eq(invoices.customerId, customers.id))
+      .where(whereCondition),
+
+    db
+      .select({
+        invoice: invoices,
+        customer: {
+          id: customers.id,
+          customerName: customers.customerName,
+          companyName: customers.companyName,
+          mobile: customers.mobile,
+          email: customers.email,
+        },
+        createdByName: users.fullName,
+      })
+      .from(invoices)
+      .innerJoin(customers, eq(invoices.customerId, customers.id))
+      .innerJoin(users, eq(invoices.createdBy, users.id))
+      .where(whereCondition)
+      .orderBy(desc(invoices.invoiceDate), desc(invoices.createdAt))
+      .limit(input.limit)
+      .offset(offset),
+  ]);
+
+  const total = Number(countResult[0]?.total ?? 0);
+
+  return {
+    items: rows.map((row) => ({
+      ...row.invoice,
+      customer: row.customer,
+      createdByName: row.createdByName,
+    })),
+    pagination: {
+      page: input.page,
+      limit: input.limit,
+      total,
+      totalPages: Math.ceil(total / input.limit),
+    },
+  };
+}
+
+export async function getInvoiceDetails(
+  context: ListInvoicesContext,
+  invoiceId: string,
+) {
+  const filters = [
+    eq(invoices.id, invoiceId),
+    eq(invoices.organizationId, context.organizationId),
+  ];
+
+  if (context.role === "technician") {
+    filters.push(eq(invoices.createdBy, context.userId));
+  }
+
+  const [row] = await db
+    .select({
+      invoice: invoices,
+      customer: customers,
+      createdByName: users.fullName,
+    })
+    .from(invoices)
+    .innerJoin(customers, eq(invoices.customerId, customers.id))
+    .innerJoin(users, eq(invoices.createdBy, users.id))
+    .where(and(...filters))
+    .limit(1);
+
+  if (!row) {
+    throw new Error("INVOICE_NOT_FOUND");
+  }
+
+  const [items, snapshot] = await Promise.all([
+    db
+      .select()
+      .from(invoiceItems)
+      .where(eq(invoiceItems.invoiceId, invoiceId))
+      .orderBy(asc(invoiceItems.lineNumber)),
+
+    db
+      .select()
+      .from(invoiceSnapshots)
+      .where(eq(invoiceSnapshots.invoiceId, invoiceId))
+      .limit(1),
+  ]);
+
+  return {
+    ...row.invoice,
+    customer: row.customer,
+    createdByName: row.createdByName,
+    items,
+    snapshot: snapshot[0]?.snapshotData ?? null,
+  };
+}
+
+export async function getInvoicePayments(
+  context: ListInvoicesContext,
+  invoiceId: string,
+) {
+  return db.transaction(async (tx) => {
+    const filters = [
+    eq(invoices.id, invoiceId),
+    eq(invoices.organizationId, context.organizationId),
+  ];
+
+  if (context.role === "technician") {
+    filters.push(eq(invoices.createdBy, context.userId));
+  }
+
+  const [invoice] = await tx
+    .select({
+      id: invoices.id,
+      grandTotal: invoices.grandTotal,
+    })
+    .from(invoices)
+    .where(and(...filters))
+    .limit(1);
+
+  if (!invoice) {
+    throw new Error("INVOICE_NOT_FOUND");
+  }
+
+  const [paymentRows, totals, adjustmentTotals] = await Promise.all([
+    tx
+      .select({
+        payment: payments,
+        recordedByName: users.fullName,
+      })
+      .from(payments)
+      .innerJoin(users, eq(payments.recordedBy, users.id))
+      .where(eq(payments.invoiceId, invoiceId))
+      .orderBy(desc(payments.paymentDate), desc(payments.createdAt)),
+
+    tx
+      .select({
+        paidAmount: sql<string>`COALESCE(SUM(${payments.amount}), 0)::text`,
+        paymentCount: count(payments.id),
+      })
+      .from(payments)
+      .where(eq(payments.invoiceId, invoiceId)),
+
+    tx
+      .select({
+        debitTotal: sql<string>`COALESCE(SUM(CASE WHEN ${invoiceAdjustments.type} = 'debit' THEN ${invoiceAdjustments.amount} ELSE 0 END), 0)::text`,
+        creditTotal: sql<string>`COALESCE(SUM(CASE WHEN ${invoiceAdjustments.type} = 'credit' THEN ${invoiceAdjustments.amount} ELSE 0 END), 0)::text`,
+      })
+      .from(invoiceAdjustments)
+      .where(eq(invoiceAdjustments.invoiceId, invoiceId)),
+  ]);
+
+  const paidAmount = totals[0]?.paidAmount ?? "0.00";
+
+  const toCents = (value: string): bigint => {
+    const [whole = "0", fraction = ""] = value.split(".");
+    return BigInt(whole) * 100n + BigInt((fraction + "00").slice(0, 2));
+  };
+
+  const formatCents = (value: bigint): string => {
+    const whole = value / 100n;
+    const fraction = (value % 100n).toString().padStart(2, "0");
+    return `${whole}.${fraction}`;
+  };
+
+  const debitTotal = toCents(adjustmentTotals[0]?.debitTotal ?? "0.00");
+  const creditTotal = toCents(adjustmentTotals[0]?.creditTotal ?? "0.00");
+
+  const adjustedTotalCents =
+    toCents(invoice.grandTotal) + debitTotal - creditTotal;
+
+  const balanceDue = adjustedTotalCents - toCents(paidAmount);
+
+  return {
+    payments: paymentRows.map((row) => ({
+      ...row.payment,
+      recordedByName: row.recordedByName,
+    })),
+    summary: {
+      grandTotal: invoice.grandTotal,
+      adjustedTotal: formatCents(adjustedTotalCents),
+      paidAmount,
+      balanceDue: formatCents(balanceDue),
+      paymentCount: totals[0]?.paymentCount ?? 0,
+    },
+  };
+  }, {
+    isolationLevel: "repeatable read",
+    accessMode: "read only",
+  });
+}
+export async function issueInvoice(
+  context: {
+    organizationId: string;
+    userId: string;
+    ipAddress?: string;
+  },
+  invoiceId: string,
+) {
+  return db.transaction(async (tx) => {
+    const [invoice] = await tx
+      .select()
+      .from(invoices)
+      .where(
+        and(
+          eq(invoices.id, invoiceId),
+          eq(invoices.organizationId, context.organizationId),
+        ),
+      )
+      .limit(1)
+      .for("update");
+
+    if (!invoice) {
+      throw new Error("INVOICE_NOT_FOUND");
+    }
+
+    if (invoice.status !== "draft") {
+      throw new Error("INVOICE_NOT_DRAFT");
+    }
+
+    const now = new Date();
+
+    const [updatedInvoice] = await tx
+      .update(invoices)
+      .set({
+        status: "issued",
+        issuedAt: now,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(invoices.id, invoice.id),
+          eq(invoices.organizationId, context.organizationId),
+        ),
+      )
+      .returning();
+
+    if (!updatedInvoice) {
+      throw new Error("INVOICE_ISSUE_FAILED");
+    }
+
+    await tx.insert(auditLogs).values({
+      organizationId: context.organizationId,
+      userId: context.userId,
+      action: "invoice.issued",
+      entityType: "invoice",
+      entityId: invoice.id,
+      description: `Invoice ${invoice.invoiceNumber} issued`,
+      oldValues: {
+        status: invoice.status,
+        issuedAt: invoice.issuedAt,
+      },
+      newValues: {
+        status: updatedInvoice.status,
+        issuedAt: updatedInvoice.issuedAt?.toISOString() ?? null,
+        invoiceNumber: updatedInvoice.invoiceNumber,
+      },
+      ipAddress: context.ipAddress ?? null,
+    });
+
+    return updatedInvoice;
+  });
+}
+
+export async function cancelInvoice(
+  context: {
+    organizationId: string;
+    userId: string;
+    ipAddress?: string;
+  },
+  invoiceId: string,
+  input: CancelInvoiceInput,
+) {
+  return db.transaction(async (tx) => {
+    // Lock the invoice so cancellation cannot race with another
+    // operation that also locks this invoice.
+    const [invoice] = await tx
+      .select()
+      .from(invoices)
+      .where(
+        and(
+          eq(invoices.id, invoiceId),
+          eq(invoices.organizationId, context.organizationId),
+        ),
+      )
+      .limit(1)
+      .for("update");
+
+    if (!invoice) {
+      throw new Error("INVOICE_NOT_FOUND");
+    }
+
+    if (invoice.status !== "issued") {
+      throw new Error("INVOICE_CANCEL_NOT_ISSUED");
+    }
+
+    // Protect against inconsistent status/payment data as well.
+    const [existingPayment] = await tx
+      .select({ id: payments.id })
+      .from(payments)
+      .where(eq(payments.invoiceId, invoice.id))
+      .limit(1);
+
+    if (existingPayment) {
+      throw new Error("INVOICE_HAS_PAYMENTS");
+    }
+
+    const now = new Date();
+    const reason = input.reason.trim();
+
+    const [updatedInvoice] = await tx
+      .update(invoices)
+      .set({
+        status: "cancelled",
+        cancelledAt: now,
+        cancellationReason: reason,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(invoices.id, invoice.id),
+          eq(invoices.organizationId, context.organizationId),
+        ),
+      )
+      .returning();
+
+    if (!updatedInvoice) {
+      throw new Error("INVOICE_CANCEL_FAILED");
+    }
+
+    await tx.insert(auditLogs).values({
+      organizationId: context.organizationId,
+      userId: context.userId,
+      action: "invoice.cancelled",
+      entityType: "invoice",
+      entityId: invoice.id,
+      description: `Invoice ${invoice.invoiceNumber} cancelled`,
+      oldValues: {
+        status: invoice.status,
+        issuedAt: invoice.issuedAt?.toISOString() ?? null,
+      },
+      newValues: {
+        status: updatedInvoice.status,
+        cancelledAt: updatedInvoice.cancelledAt?.toISOString() ?? null,
+        cancellationReason: updatedInvoice.cancellationReason,
+        invoiceNumber: updatedInvoice.invoiceNumber,
+      },
+      ipAddress: context.ipAddress ?? null,
+    });
+
+    return updatedInvoice;
+  });
+}
+
+export async function createPayment(
+  context: {
+    organizationId: string;
+    userId: string;
+    ipAddress?: string;
+  },
+  invoiceId: string,
+  input: CreatePaymentInput,
+) {
+  return db.transaction(async (tx) => {
+    // Serialize payment recording against cancellation and other payments.
+    const [invoice] = await tx
+      .select()
+      .from(invoices)
+      .where(
+        and(
+          eq(invoices.id, invoiceId),
+          eq(invoices.organizationId, context.organizationId),
+        ),
+      )
+      .limit(1)
+      .for("update");
+
+    if (!invoice) {
+      throw new Error("INVOICE_NOT_FOUND");
+    }
+
+    if (invoice.status === "cancelled") {
+      throw new Error("INVOICE_CANCELLED");
+    }
+
+    if (invoice.status === "paid") {
+      throw new Error("INVOICE_ALREADY_PAID");
+    }
+
+    if (invoice.status !== "issued" && invoice.status !== "partially_paid") {
+      throw new Error("INVOICE_NOT_PAYABLE");
+    }
+
+    // Read the existing total from the database.
+    const [paymentSummary] = await tx
+      .select({
+        total: sql<string>`COALESCE(SUM(${payments.amount}), 0)::text`,
+      })
+      .from(payments)
+      .where(eq(payments.invoiceId, invoice.id));
+
+    const [adjustmentSummary] = await tx
+      .select({
+        debitTotal: sql<string>`COALESCE(SUM(CASE WHEN ${invoiceAdjustments.type} = 'debit' THEN ${invoiceAdjustments.amount} ELSE 0 END), 0)::text`,
+        creditTotal: sql<string>`COALESCE(SUM(CASE WHEN ${invoiceAdjustments.type} = 'credit' THEN ${invoiceAdjustments.amount} ELSE 0 END), 0)::text`,
+      })
+      .from(invoiceAdjustments)
+      .where(eq(invoiceAdjustments.invoiceId, invoice.id));
+
+    // Convert decimal strings to integer cents to avoid floating-point
+    // arithmetic when checking the outstanding balance.
+    const toCents = (value: string) => {
+      const [whole = "0", fraction = ""] = value.split(".");
+
+      return BigInt(whole) * 100n + BigInt((fraction + "00").slice(0, 2));
+    };
+    const debitCents = toCents(adjustmentSummary?.debitTotal ?? "0");
+    const creditCents = toCents(adjustmentSummary?.creditTotal ?? "0");
+
+    const adjustedTotalCents =
+      toCents(invoice.grandTotal) + debitCents - creditCents;
+
+    const paidCents = toCents(paymentSummary?.total ?? "0");
+    const newPaymentCents = BigInt(Math.round(input.amount * 100));
+
+    if (newPaymentCents > adjustedTotalCents - paidCents) {
+      throw new Error("PAYMENT_EXCEEDS_BALANCE");
+    }
+
+    const updatedPaidCents = paidCents + newPaymentCents;
+    const balanceDueCents = adjustedTotalCents - updatedPaidCents;
+
+    const newStatus = balanceDueCents === 0n ? "paid" : "partially_paid";
+
+    const [payment] = await tx
+      .insert(payments)
+      .values({
+        invoiceId: invoice.id,
+        recordedBy: context.userId,
+        paymentDate: input.paymentDate,
+        amount: input.amount.toFixed(2),
+        method: input.method,
+        referenceNumber: input.referenceNumber?.trim() || null,
+        notes: input.notes?.trim() || null,
+      })
+      .returning();
+
+    if (!payment) {
+      throw new Error("PAYMENT_CREATE_FAILED");
+    }
+
+    const [updatedInvoice] = await tx
+      .update(invoices)
+      .set({
+        status: newStatus,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(invoices.id, invoice.id),
+          eq(invoices.organizationId, context.organizationId),
+        ),
+      )
+      .returning();
+
+    if (!updatedInvoice) {
+      throw new Error("PAYMENT_INVOICE_UPDATE_FAILED");
+    }
+
+    await tx.insert(auditLogs).values({
+      organizationId: context.organizationId,
+      userId: context.userId,
+      action: "invoice.payment_recorded",
+      entityType: "invoice",
+      entityId: invoice.id,
+      description: `Payment of ${input.amount.toFixed(2)} recorded for invoice ${invoice.invoiceNumber}`,
+      oldValues: {
+        status: invoice.status,
+        paidAmount: (Number(paidCents) / 100).toFixed(2),
+        balanceDue: (Number(adjustedTotalCents - paidCents) / 100).toFixed(2),
+      },
+      newValues: {
+        status: updatedInvoice.status,
+        paymentId: payment.id,
+        paymentAmount: payment.amount,
+        paymentMethod: payment.method,
+        paymentDate: payment.paymentDate,
+        paidAmount: (Number(updatedPaidCents) / 100).toFixed(2),
+        balanceDue: (Number(balanceDueCents) / 100).toFixed(2),
+      },
+      ipAddress: context.ipAddress ?? null,
+    });
+
+    return {
+      payment,
+      invoice: updatedInvoice,
+      paidAmount: (Number(updatedPaidCents) / 100).toFixed(2),
+      balanceDue: (Number(balanceDueCents) / 100).toFixed(2),
+    };
+  });
+}
+
+export async function createInvoiceAdjustment(
+  context: {
+    organizationId: string;
+    userId: string;
+    ipAddress?: string;
+  },
+  invoiceId: string,
+  input: CreateInvoiceAdjustmentInput,
+) {
+  return db.transaction(async (tx) => {
+    // Serialize adjustments against payments and cancellation.
+    const [invoice] = await tx
+      .select()
+      .from(invoices)
+      .where(
+        and(
+          eq(invoices.id, invoiceId),
+          eq(invoices.organizationId, context.organizationId),
+        ),
+      )
+      .limit(1)
+      .for("update");
+
+    if (!invoice) {
+      throw new Error("INVOICE_NOT_FOUND");
+    }
+
+    if (
+      invoice.status !== "issued" &&
+      invoice.status !== "partially_paid" &&
+      invoice.status !== "paid"
+    ) {
+      throw new Error("INVOICE_ADJUSTMENT_NOT_ALLOWED");
+    }
+
+    const [paymentSummary, existingAdjustments] = await Promise.all([
+      tx
+        .select({
+          total: sql<string>`COALESCE(SUM(${payments.amount}), 0)::text`,
+        })
+        .from(payments)
+        .where(eq(payments.invoiceId, invoice.id)),
+
+      tx
+        .select({
+          type: invoiceAdjustments.type,
+          amount: invoiceAdjustments.amount,
+        })
+        .from(invoiceAdjustments)
+        .where(eq(invoiceAdjustments.invoiceId, invoice.id)),
+    ]);
+
+    const toCents = (value: string) => {
+      const [whole = "0", fraction = ""] = value.split(".");
+      return BigInt(whole) * 100n + BigInt((fraction + "00").slice(0, 2));
+    };
+
+    const formatCents = (value: bigint) => {
+      const whole = value / 100n;
+      const fraction = (value % 100n).toString().padStart(2, "0");
+      return `${whole}.${fraction}`;
+    };
+
+    const originalTotalCents = toCents(invoice.grandTotal);
+    const paidCents = toCents(paymentSummary[0]?.total ?? "0");
+
+    let adjustmentNetCents = 0n;
+
+    for (const adjustment of existingAdjustments) {
+      const amountCents = toCents(adjustment.amount);
+
+      adjustmentNetCents +=
+        adjustment.type === "debit" ? amountCents : -amountCents;
+    }
+
+    const currentAdjustedTotalCents = originalTotalCents + adjustmentNetCents;
+
+    const amountCents = BigInt(Math.round(input.amount * 100));
+
+    const newAdjustedTotalCents =
+      input.type === "debit"
+        ? currentAdjustedTotalCents + amountCents
+        : currentAdjustedTotalCents - amountCents;
+
+    if (newAdjustedTotalCents <= 0n) {
+      throw new Error("ADJUSTMENT_TOTAL_INVALID");
+    }
+
+    if (newAdjustedTotalCents < paidCents) {
+      throw new Error("ADJUSTMENT_EXCEEDS_PAID_AMOUNT");
+    }
+
+    const updatedPaidStatus =
+      newAdjustedTotalCents === paidCents
+        ? "paid"
+        : paidCents > 0n
+          ? "partially_paid"
+          : "issued";
+
+    const [adjustment] = await tx
+      .insert(invoiceAdjustments)
+      .values({
+        invoiceId: invoice.id,
+        createdBy: context.userId,
+        type: input.type,
+        amount: input.amount.toFixed(2),
+        reason: input.reason.trim(),
+        notes: input.notes?.trim() || null,
+      })
+      .returning();
+
+    if (!adjustment) {
+      throw new Error("ADJUSTMENT_CREATE_FAILED");
+    }
+
+    const [updatedInvoice] = await tx
+      .update(invoices)
+      .set({
+        status: updatedPaidStatus,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(invoices.id, invoice.id),
+          eq(invoices.organizationId, context.organizationId),
+        ),
+      )
+      .returning();
+
+    if (!updatedInvoice) {
+      throw new Error("ADJUSTMENT_INVOICE_UPDATE_FAILED");
+    }
+
+    const balanceDueCents = newAdjustedTotalCents - paidCents;
+
+    await tx.insert(auditLogs).values({
+      organizationId: context.organizationId,
+      userId: context.userId,
+      action: "invoice.adjustment_recorded",
+      entityType: "invoice",
+      entityId: invoice.id,
+      description: `${input.type === "credit" ? "Credit" : "Debit"} adjustment of ${input.amount.toFixed(2)} recorded for invoice ${invoice.invoiceNumber}`,
+      oldValues: {
+        status: invoice.status,
+        adjustedTotal: formatCents(currentAdjustedTotalCents),
+        paidAmount: formatCents(paidCents),
+        balanceDue: formatCents(currentAdjustedTotalCents - paidCents),
+      },
+      newValues: {
+        status: updatedInvoice.status,
+        adjustmentId: adjustment.id,
+        adjustmentType: adjustment.type,
+        adjustmentAmount: adjustment.amount,
+        adjustedTotal: formatCents(newAdjustedTotalCents),
+        paidAmount: formatCents(paidCents),
+        balanceDue: formatCents(balanceDueCents),
+      },
+      ipAddress: context.ipAddress ?? null,
+    });
+
+    return {
+      adjustment,
+      invoice: updatedInvoice,
+      summary: {
+        originalTotal: invoice.grandTotal,
+        adjustedTotal: formatCents(newAdjustedTotalCents),
+        paidAmount: formatCents(paidCents),
+        balanceDue: formatCents(balanceDueCents),
+      },
+    };
+  });
+}
+
+export async function getInvoiceAdjustments(
+  context: ListInvoicesContext,
+  invoiceId: string,
+) {
+  return db.transaction(async (tx) => {
+    const filters = [
+    eq(invoices.id, invoiceId),
+    eq(invoices.organizationId, context.organizationId),
+  ];
+
+  if (context.role === "technician") {
+    filters.push(eq(invoices.createdBy, context.userId));
+  }
+
+  const [invoice] = await tx
+    .select({
+      id: invoices.id,
+      grandTotal: invoices.grandTotal,
+    })
+    .from(invoices)
+    .where(and(...filters))
+    .limit(1);
+
+  if (!invoice) {
+    throw new Error("INVOICE_NOT_FOUND");
+  }
+
+  const [adjustmentRows, paymentSummary] = await Promise.all([
+    tx
+      .select({
+        adjustment: invoiceAdjustments,
+        createdByName: users.fullName,
+      })
+      .from(invoiceAdjustments)
+      .innerJoin(users, eq(invoiceAdjustments.createdBy, users.id))
+      .where(eq(invoiceAdjustments.invoiceId, invoiceId))
+      .orderBy(desc(invoiceAdjustments.createdAt)),
+
+    tx
+      .select({
+        paidAmount: sql<string>`COALESCE(SUM(${payments.amount}), 0)::text`,
+      })
+      .from(payments)
+      .where(eq(payments.invoiceId, invoiceId)),
+  ]);
+
+  const toCents = (value: string) => {
+    const [whole = "0", fraction = ""] = value.split(".");
+    return BigInt(whole) * 100n + BigInt((fraction + "00").slice(0, 2));
+  };
+
+  const formatCents = (value: bigint) => {
+    const whole = value / 100n;
+    const fraction = (value % 100n).toString().padStart(2, "0");
+    return `${whole}.${fraction}`;
+  };
+
+  const paidAmount = paymentSummary[0]?.paidAmount ?? "0.00";
+
+  let adjustedTotalCents = toCents(invoice.grandTotal);
+
+  for (const row of adjustmentRows) {
+    const amountCents = toCents(row.adjustment.amount);
+
+    adjustedTotalCents +=
+      row.adjustment.type === "debit" ? amountCents : -amountCents;
+  }
+
+  const paidCents = toCents(paidAmount);
+
+  return {
+    adjustments: adjustmentRows.map((row) => ({
+      ...row.adjustment,
+      createdByName: row.createdByName,
+    })),
+    summary: {
+      originalTotal: invoice.grandTotal,
+      adjustedTotal: formatCents(adjustedTotalCents),
+      paidAmount,
+      balanceDue: formatCents(adjustedTotalCents - paidCents),
+      adjustmentCount: adjustmentRows.length,
+    },
+  };
+  }, {
+    isolationLevel: "repeatable read",
+    accessMode: "read only",
+  });
+}

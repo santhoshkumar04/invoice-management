@@ -1,0 +1,41 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1795173624197,
+      "tag": "0000_abnormal_satana",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1795417490884,
+      "tag": "0001_lumpy_shockwave",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1795455068123,
+      "tag": "0002_outstanding_purifiers",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1795530530290,
+      "tag": "0003_organic_viper",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1795553382884,
+      "tag": "0004_quiet_hellcat",
+      "breakpoints": true
+    }
+  ]
+}

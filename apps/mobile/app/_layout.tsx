@@ -1,56 +1,93 @@
-import { useFonts } from 'expo-font';
-import { DarkTheme, DefaultTheme, Stack, ThemeProvider } from 'expo-router';
-import * as SplashScreen from 'expo-splash-screen';
-import { useEffect } from 'react';
-import 'react-native-reanimated';
+import { useEffect } from "react";
+import { Stack, useRouter, useSegments } from "expo-router";
+import { StatusBar } from "expo-status-bar";
+import { ActivityIndicator, View } from "react-native";
 
-import { useColorScheme } from '@/components/useColorScheme';
+import { QueryProvider } from "../src/providers/QueryProvider";
+import { useAuthStore } from "../src/stores/auth.store";
+import { colors } from "../src/theme/colors";
 
-export {
-  // Catch any errors thrown by the Layout component.
-  ErrorBoundary,
-} from 'expo-router';
+function RootNavigator() {
+  const router = useRouter();
+  const segments = useSegments();
 
-export const unstable_settings = {
-  // Ensure that reloading on `/modal` keeps a back button present.
-  anchor: '(tabs)',
-};
-
-// Prevent the splash screen from auto-hiding before asset loading is complete.
-SplashScreen.preventAutoHideAsync();
-
-export default function RootLayout() {
-  const [loaded, error] = useFonts({
-    SpaceMono: require('../assets/fonts/SpaceMono-Regular.ttf'),
-  });
-
-  // Expo Router uses Error Boundaries to catch errors in the navigation tree.
-  useEffect(() => {
-    if (error) throw error;
-  }, [error]);
+  const { user, isAuthenticated, isInitialized, initialize } =
+    useAuthStore();
 
   useEffect(() => {
-    if (loaded) {
-      SplashScreen.hideAsync();
+    void initialize();
+  }, [initialize]);
+
+  useEffect(() => {
+    if (!isInitialized) return;
+
+    const firstSegment = segments[0];
+
+    if (!isAuthenticated) {
+      if (firstSegment !== "(auth)") {
+        router.replace("/(auth)/login");
+      }
+      return;
     }
-  }, [loaded]);
 
-  if (!loaded) {
-    return null;
-  }
+    if (!user) return;
 
-  return <RootLayoutNav />;
-}
+    if (firstSegment === "(auth)") {
+      router.replace(
+        user.role === "admin"
+          ? "/(admin)/dashboard"
+          : "/(technician)/dashboard",
+      );
+      return;
+    }
 
-function RootLayoutNav() {
-  const colorScheme = useColorScheme();
+    if (firstSegment === "(admin)" && user.role !== "admin") {
+      router.replace("/(technician)/dashboard");
+      return;
+    }
+
+    if (firstSegment === "(technician)" && user.role !== "technician") {
+      router.replace("/(admin)/dashboard");
+    }
+  }, [isInitialized, isAuthenticated, user, segments, router]);
 
   return (
-    <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
-      <Stack>
-        <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-        <Stack.Screen name="modal" options={{ presentation: 'modal' }} />
+    <>
+      <StatusBar style="dark" />
+
+      <Stack screenOptions={{ headerShown: false }}>
+        <Stack.Screen name="(auth)/login" />
+        <Stack.Screen name="(admin)" />
+        <Stack.Screen name="(technician)" />
+        <Stack.Screen name="invoice/[id]" />
+        <Stack.Screen name="invoice-pdf-preview" />
       </Stack>
-    </ThemeProvider>
+
+      {!isInitialized && (
+        <View
+          style={{
+            position: "absolute",
+            top: 0,
+            right: 0,
+            bottom: 0,
+            left: 0,
+            zIndex: 1000,
+            backgroundColor: colors.background,
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <ActivityIndicator size="large" color={colors.primary} />
+        </View>
+      )}
+    </>
+  );
+}
+
+export default function RootLayout() {
+  return (
+    <QueryProvider>
+      <RootNavigator />
+    </QueryProvider>
   );
 }

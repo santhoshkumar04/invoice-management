@@ -1,0 +1,2 @@
+CREATE INDEX "invoice_adjustments_invoice_idx" ON "invoice_adjustments" USING btree ("invoice_id");--> statement-breakpoint
+ALTER TABLE "invoice_adjustments" ADD CONSTRAINT "invoice_adjustments_amount_positive" CHECK ("invoice_adjustments"."amount" > 0);

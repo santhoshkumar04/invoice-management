@@ -29,3 +29,6 @@ Thumbs.db
 # Temporary files
 tmp/
 temp/
+
+# Private uploaded invoice documents
+apps/api/storage/

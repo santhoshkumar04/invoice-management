@@ -1,0 +1,1 @@
+ALTER TABLE "organizations" ADD COLUMN "vendor_code" varchar(50);

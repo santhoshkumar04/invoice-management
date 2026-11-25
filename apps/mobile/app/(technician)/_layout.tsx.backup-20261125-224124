@@ -1,0 +1,20 @@
+import { Stack, Redirect } from "expo-router";
+
+import { useAuthStore } from "../../src/stores/auth.store";
+
+export default function TechnicianLayout() {
+  const user = useAuthStore((state) => state.user);
+
+  if (!user || user.role !== "technician") {
+    return <Redirect href="/(auth)/login" />;
+  }
+
+  return (
+    <Stack screenOptions={{ headerShown: false }}>
+      <Stack.Screen name="dashboard" />
+      <Stack.Screen name="create-invoice" />
+      <Stack.Screen name="history" />
+      <Stack.Screen name="profile" />
+    </Stack>
+  );
+}
