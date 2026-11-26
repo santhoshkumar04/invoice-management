@@ -3064,4 +3064,72 @@ describe("Invoice API integration tests", () => {
       expect(auditResult.rows[0].new_values.passwordChanged).toBe(true);
     });
   });
+
+  describe("Reports API integration tests", () => {
+    const reportEndpoints = [
+      "/reports/overview",
+      "/reports/sales",
+      "/reports/payments",
+      "/reports/outstanding",
+      "/reports/gst",
+      "/reports/customers",
+    ];
+
+    it("rejects report requests without authentication", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: "/reports/overview",
+      });
+
+      expect(response.statusCode).toBe(401);
+    });
+
+    it("allows Admin and Technician to access all report endpoints", async () => {
+      for (const token of [adminToken, technicianToken]) {
+        for (const endpoint of reportEndpoints) {
+          const response = await app.inject({
+            method: "GET",
+            url: endpoint,
+            headers: {
+              authorization: `Bearer ${token}`,
+            },
+          });
+
+          expect(
+            response.statusCode,
+            `${endpoint} should return 200`,
+          ).toBe(200);
+
+          expect(response.json().success).toBe(true);
+          expect(response.json().data).toBeDefined();
+        }
+      }
+    });
+
+    it("rejects invalid report date ranges", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: "/reports/sales?from=2026-11-30&to=2026-11-01",
+        headers: {
+          authorization: `Bearer ${adminToken}`,
+        },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.code).toBe("VALIDATION_ERROR");
+    });
+
+    it("rejects unsupported sales grouping values", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: "/reports/sales?groupBy=year",
+        headers: {
+          authorization: `Bearer ${adminToken}`,
+        },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.code).toBe("VALIDATION_ERROR");
+    });
+  });
 });

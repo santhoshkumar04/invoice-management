@@ -1,4 +1,4 @@
-import { StyleSheet, Text, View, Pressable } from "react-native";
+﻿import { StyleSheet, Text, View, Pressable } from "react-native";
 
 import { useRouter } from "expo-router";
 
@@ -8,6 +8,7 @@ import {
   Settings,
   LogOut,
   Receipt,
+  BarChart3,
   UserRound,
 } from "lucide-react-native";
 
@@ -18,6 +19,7 @@ import { StatCard } from "../../src/components/dashboard/StatCard";
 import { SectionHeader } from "../../src/components/dashboard/SectionHeader";
 
 import { useAuthStore } from "../../src/stores/auth.store";
+import { useOverviewReport, useCustomersReport } from "../../src/hooks/use-reports";
 
 import { colors } from "../../src/theme/colors";
 import { radius } from "../../src/theme/spacing";
@@ -27,6 +29,36 @@ export default function AdminDashboard() {
 
   const user = useAuthStore((state) => state.user);
   const signOut = useAuthStore((state) => state.signOut);
+
+  const overviewQuery = useOverviewReport();
+  const customersQuery = useCustomersReport({ page: 1, limit: 1 });
+
+  const overview = overviewQuery.data;
+  const customerSummary = customersQuery.data?.summary;
+
+  const formatCurrency = (value: string | undefined) => {
+    if (value === undefined) {
+      return "—";
+    }
+
+    const amount = Number(value);
+
+    if (!Number.isFinite(amount)) {
+      return "—";
+    }
+
+    return new Intl.NumberFormat("en-IN", {
+      style: "currency",
+      currency: "INR",
+      maximumFractionDigits: 2,
+    }).format(amount);
+  };
+
+  const reportValue = (isPending: boolean, isError: boolean, value: string) => {
+    if (isPending) return "...";
+    if (isError) return "Unavailable";
+    return value;
+  };
 
   const handleLogout = async () => {
     await signOut();
@@ -63,22 +95,50 @@ export default function AdminDashboard() {
 
       <SectionHeader title="Overview" />
 
-      <View style={styles.stats}>
+            <View style={styles.stats}>
         <StatCard
           title="Total invoices"
-          value="—"
-          subtitle="Awaiting live data"
+          value={reportValue(
+            overviewQuery.isPending,
+            overviewQuery.isError,
+            String(overview?.invoiceCount ?? 0)
+          )}
+          subtitle="Invoices in the selected period"
         />
 
         <StatCard
           title="Total billed"
-          value="—"
-          subtitle="Awaiting live data"
+          value={
+            overviewQuery.isPending
+              ? "..."
+              : overviewQuery.isError
+                ? "Unavailable"
+                : formatCurrency(overview?.billedTotal)
+          }
+          subtitle="Total invoice value"
         />
 
-        <StatCard title="Outstanding" value="—" subtitle="Awaiting live data" />
+        <StatCard
+          title="Outstanding"
+          value={
+            overviewQuery.isPending
+              ? "..."
+              : overviewQuery.isError
+                ? "Unavailable"
+                : formatCurrency(overview?.outstandingTotal)
+          }
+          subtitle="Unpaid invoice balance"
+        />
 
-        <StatCard title="Customers" value="—" subtitle="Awaiting live data" />
+        <StatCard
+          title="Customers"
+          value={reportValue(
+            customersQuery.isPending,
+            customersQuery.isError,
+            String(customerSummary?.customerCount ?? 0)
+          )}
+          subtitle="Registered customers"
+        />
       </View>
 
       <SectionHeader title="Management" />
@@ -89,6 +149,13 @@ export default function AdminDashboard() {
           title="Invoices"
           subtitle="View and manage invoices"
           onPress={() => router.push("/(admin)/invoices")}
+        />
+
+        <Action
+          icon={<BarChart3 color={colors.primary} />}
+          title="Reports"
+          subtitle="Business performance and analytics"
+          onPress={() => router.push("/(admin)/reports")}
         />
 
         <Action
@@ -245,3 +312,6 @@ const styles = StyleSheet.create({
     fontWeight: "700",
   },
 });
+
+
+

@@ -1,4 +1,4 @@
-import { Stack } from "expo-router";
+﻿import { Stack } from "expo-router";
 
 export default function AdminLayout() {
   return (
@@ -16,6 +16,7 @@ export default function AdminLayout() {
       <Stack.Screen name="team-manage" />
       <Stack.Screen name="profile" />
       <Stack.Screen name="settings" />
+      <Stack.Screen name="reports" />
     </Stack>
   );
 }

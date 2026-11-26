@@ -1,18 +1,19 @@
-import Fastify from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
-import rateLimit from "@fastify/rate-limit";
 import multipart from "@fastify/multipart";
+import rateLimit from "@fastify/rate-limit";
+import Fastify from "fastify";
 
-import { healthRoutes } from "./routes/health.js";
-import { databaseHealthRoutes } from "./routes/database-health.js";
 import { authRoutes } from "./modules/auth/auth.routes.js";
-import { protectedRoutes } from "./routes/protected.js";
-import { usersRoutes } from "./modules/users/users.routes.js";
 import { customersRoutes } from "./modules/customers/customers.routes.js";
-import { invoicesRoutes } from "./modules/invoices/invoices.routes.js";
 import { invoiceDocumentsRoutes } from "./modules/invoice-documents/invoice-documents.routes.js";
+import { invoicesRoutes } from "./modules/invoices/invoices.routes.js";
 import { organizationsRoutes } from "./modules/organizations/organizations.routes.js";
+import { reportsRoutes } from "./modules/reports/reports.routes.js";
+import { usersRoutes } from "./modules/users/users.routes.js";
+import { databaseHealthRoutes } from "./routes/database-health.js";
+import { healthRoutes } from "./routes/health.js";
+import { protectedRoutes } from "./routes/protected.js";
 
 export async function buildApp() {
   const app = Fastify({
@@ -52,6 +53,7 @@ export async function buildApp() {
   await app.register(invoicesRoutes);
   await app.register(invoiceDocumentsRoutes);
   await app.register(organizationsRoutes);
+  await app.register(reportsRoutes);
   await app.register(protectedRoutes);
 
   app.setNotFoundHandler(async (request, reply) => {
